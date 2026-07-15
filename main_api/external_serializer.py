@@ -50,5 +50,8 @@ class PutDataSerializer(serializers.Serializer):
     delivery = serializers.IntegerField()
     height = serializers.IntegerField()
     length = serializers.IntegerField()
-    width = serializers.IntegerField()
-        
+    width = serializers.IntegerField()  
+
+
+class ActivateProductSerializer(serializers.Serializer):
+    controller = serializers.ChoiceField(choices=["jv", "xl"], required=True)

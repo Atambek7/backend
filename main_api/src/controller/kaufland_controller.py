@@ -96,6 +96,25 @@ except ValueError:
 EMBEDDED_ENTITIES = ["category", "category_basic", "units"]
 
 
+def format_si_dimension(value: Any, default_unit: str = "cm") -> list[str] | None:
+    """Return Kaufland SI dimension format, e.g. ["184,5cm"]."""
+    text = KauflandController._as_scalar_string(value)
+    if not text:
+        return None
+
+    match = re.search(
+        r"(\d+(?:[,.]\d+)?)\s*(mm|cm|m|km)?\b",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return None
+
+    number = match.group(1).replace(".", ",")
+    unit = (match.group(2) or default_unit).lower()
+    return [f"{number}{unit}"]
+
+
 class KauflandController:
     """
     Класс для взаимодействия с кауфлендом
@@ -860,7 +879,7 @@ class KauflandController:
 
     async def _check_product_by_unit_id(self, ean, job_id: str | None = None):
         """
-        Check a single product by unit_id.
+    Check a single product by unit_id.
         """
         final_res = await self._fetch_main_data_by_ean(ean)
         if final_res:
@@ -1054,9 +1073,9 @@ class KauflandController:
             level="info",
         )
 
-        height = self._as_scalar_string(elem.get("height"))
-        length = self._as_scalar_string(elem.get("length"))
-        width = self._as_scalar_string(elem.get("width"))
+        height = format_si_dimension(elem.get("height"))
+        length = format_si_dimension(elem.get("length"))
+        width = format_si_dimension(elem.get("width"))
 
         # Получаем SSH клиент
         # with log_time("Connection to ssh"):
@@ -1236,7 +1255,6 @@ class KauflandController:
 
         for key, value in optional_fields.items():
             if value:
-                # Kaufland expects scalar strings for these attributes.
                 attributes[key] = value
 
         json_body = {"ean": [ean], "attributes": attributes}
@@ -1955,7 +1973,7 @@ class KauflandController:
             else:
                 response_data[key] = [value]
         response_data["price"] = prices
-        response_data["unit_id"] = units[0].get("id_unit")
+        response_data["units"] = units
 
         return {"response_data": response_data}
 

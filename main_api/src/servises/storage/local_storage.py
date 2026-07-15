@@ -13,7 +13,10 @@ class LocalImageStorage(ImageStorage):
     ):
         self.base_dir = base_dir
         self.url_prefix = "/" + url_prefix.strip("/")
-        self.public_base_url = (public_base_url or f"https://{MAIN_HOST}").rstrip("/")
+        env_public_base_url = os.getenv("LOCAL_IMAGE_PUBLIC_BASE_URL")
+        self.public_base_url = (
+            public_base_url or env_public_base_url or f"https://{MAIN_HOST}"
+        ).rstrip("/")
         os.makedirs(self.base_dir, exist_ok=True)
 
     def _public_url_for_filename(self, filename: str) -> str:

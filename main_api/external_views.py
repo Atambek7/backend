@@ -4,6 +4,7 @@ import re
 from uuid import uuid4
 
 import aiohttp
+from attr import dataclass
 from config import JV_CONTACT_DATA, JV_MANUFACTURER, XL_CONTACT_DATA, XL_MANUFACTURER
 from adrf.views import APIView
 from rest_framework import status
@@ -15,7 +16,8 @@ from main_api.serializers import RetrieveProductSerializer
 from main_api.external_serializer import (
     DeleteDataSerializer, 
     ProductDataSerializer,
-    PutDataSerializer
+    PutDataSerializer,
+    ActivateProductSerializer
     )
 from main_api.services.aftercool_service import (
     AftercoolAuthError,
@@ -23,12 +25,14 @@ from main_api.services.aftercool_service import (
     AftercoolUpstreamError,
 )
 from main_api.services.aftercool_price_sync_service import AftercoolPriceSyncService
-from main_api.src.controller.kaufland_controller import KauflandController
+from main_api.src.controller.kaufland_controller import KauflandController, format_si_dimension
 from main_api.src.controller.rest_api_controller import RestApiController
 from main_api.src.gpt.gpt_helper import generate_seo
 from main_api.src.job_registry import clear_cancel, is_cancelled, register_running_job, unregister_running_job
 from main_api.src.logger import log
 from config import storefronts
+
+from main_api.models import Unit
 
 
 try:
@@ -468,6 +472,12 @@ class PutProductView(APIView):
         
         validated_data = serializer.validated_data
         
+        result = {
+            "data": {},
+            "errors": {},
+            "success": False,
+        }
+        
         # Main body
         ean = validated_data["ean"]
         controller = validated_data["controller"]
@@ -486,7 +496,7 @@ class PutProductView(APIView):
         attributes = {
             "title": [validated_data["title"]],
             "description": [validated_data["description"]],
-            "pictures": [validated_data["picture"]],
+            "picture": validated_data["picture"],
             "product_safety_contact": get_product_safety_contact(controller) 
         }
         
@@ -499,6 +509,7 @@ class PutProductView(APIView):
                 material = material
             )
         except Exception as e:
+            result["errors"] = {"gtp_error": str(e)}
             seo_list = []
             
         attributes["short_description"] = seo_list
@@ -507,16 +518,11 @@ class PutProductView(APIView):
             "item": {
                 "title": attributes["title"][0],
                 "description": attributes["description"][0],
-                "manufacturer": "AEA GmbH & Co. KG",
+                "manufacturer": "AEA GmbH & Co. KG" if controller == "jv" else "XL MOEBEL GmbH",
             },
             "price": price
         }
         
-        result = {
-            "data": {},
-            "errors": {},
-            "success": False,
-        }
         # Category selector
         async with aiohttp.ClientSession() as client:
             try:
@@ -538,12 +544,19 @@ class PutProductView(APIView):
             "title": category_name,
             "name": category_name,
         }
-        attributes["width"] = width
-        attributes["length"] = length
-        attributes["height"] = height
+        formatted_width = format_si_dimension(width)
+        formatted_length = format_si_dimension(length)
+        formatted_height = format_si_dimension(height)
+        if formatted_width:
+            attributes["width"] = formatted_width
+        if formatted_length:
+            attributes["length"] = formatted_length
+        if formatted_height:
+            attributes["height"] = formatted_height
         attributes["material"] = material
         attributes["colour"] = color
         attributes["size"] = size
+        attributes["manufacturer_number"] = "JVM" + str(ean)
         
         # Product data creation
         product_data = {
@@ -564,7 +577,7 @@ class PutProductView(APIView):
         
         # Unit creation
         unit_data = {
-            "amout": 20,
+            "amount": 20,
             "handling_time": delivery,
             "listing_price": price,
             "minimum_price": price,
@@ -580,21 +593,175 @@ class PutProductView(APIView):
                     response = await rac.send_request("POST", endpoint, json=unit_data)
                     
                 except Exception as e:
-                    result["errors"] = {**result.get("errors", {}), "storefront": {f"{storefront}": False, "detail": str(e)}}
+                    offer = result.setdefault("data", {}).setdefault("offer", {})
+                    statuses = offer.setdefault("statuses", {})
+                    if "already exists" in str(e):
+                        statuses[storefront] = "already exists"
                     continue
                 
-                finally:
-                    result["data"]["offer"] = {**result.get("data", {}).get(f"offer", {}), "statuses": {f"{storefront}": "created"}}
+                offer = result.setdefault("data", {}).setdefault("offer", {})
+                statuses = offer.setdefault("statuses", {})
+                statuses[storefront] = "created"
 
-        if len(result["data"]["offer"]["statuses"]) == 7 and all([status == "created" for status in result["data"]["offer"]["statuses"]["storefront"]]):
+        result["send_data"] = product_data
+        print(result)
+        
+        if len(result["data"]["offer"]["statuses"]) == 7 and all([status == "created" for status in result["data"]["offer"]["statuses"].values()]):
             result["data"]["offer"] = {**result.get("data", {}).get("offer", {}), "status": "success"}
             return Response({"result": result}, status=status.HTTP_201_CREATED)
         
-        elif len(result["data"]["offer"]["statuses"]) != 7 and all([status == "created" for status in result["data"]["offer"]["statuses"]["storefront"]]):
+        elif len(result["data"]["offer"]["statuses"]) != 7 and all([status == "created" for status in result["data"]["offer"]["statuses"].values()]):
             result["data"]["offer"] = {**result.get("data", {}).get("offer", {}), "status": "partial success"}
             return Response({"result": result, "completed": "partial"}, status=status.HTTP_201_CREATED)
         
         else:
             result["data"]["offer"] = {**result.get("data", {}).get("offer", {}), "status": "failed"}
             return Response({"result": result, "completed": "none"}, status=status.HTTP_422_UNPROCESSABLE_ENTITY)
+
+
+class DeactivateProductView(APIView):
+    serializer_class = DeleteDataSerializer
+    permission_classes = [AllowAny]
+    
+    
+    async def delete(self, request, ean: str):
+        serializer = self.serializer_class(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        controller = serializer.validated_data["controller"]
+
+        result = {
+            "response": [],
+            "failed_storefronts": [],
+        }
+
+        async with aiohttp.ClientSession() as client:
+            rac = RestApiController(
+                controller=controller,
+                session=client,
+            )
+            for storefront in storefronts:
+                try:
+                    get_response = await rac.send_request(
+                        method="GET",
+                        endpoint=(
+                            f"/product/ean/{ean}"
+                            f"?storefront={storefront}&embedded=units"
+                        ),
+                    )
+                    units = get_response["data"]["units"]
+
+                    if not units:
+                        result["failed_storefronts"].append({
+                            "storefront": storefront,
+                            "error": "Units not found",
+                        })
+                        continue
+
+                    unit_data = units[0]
+                    unit_id = unit_data["id_unit"]
+
+                    delete_response = await rac.send_request(
+                        method="DELETE",
+                        endpoint=f"/units/{unit_id}?storefront={storefront}",
+                    )
+
+                    if delete_response["status"] != 204:
+                        result["failed_storefronts"].append({
+                            "storefront": storefront,
+                            "error": f"Unexpected status",
+                        })
+                        continue
+
+                    await Unit.objects.aupdate_or_create(
+                        ean=ean,
+                        controller=controller,
+                        storefront=storefront,
+                        defaults={
+                            "unit": unit_data
+                        }
+                    )
+
+                    result["response"].append({
+                        "storefront": storefront,
+                        "unit": unit_data,
+                    })
+
+                except Exception as error:
+                    result["failed_storefronts"].append({
+                        "storefront": storefront,
+                        "error": str(error),
+                    })
+            return Response(result)
+
+
+class ActivateProductView(APIView):
+    serializer_class = ActivateProductSerializer
+    permission_classes = [AllowAny]
+    
+    
+    
+    def build_payload(self, unit: dict, ean: str):
+        return {
+        "amount": unit["amount"],
+        "handling_time": unit.get("delivery_time_min", 0),
+        "listing_price": unit["price"],
+        "minimum_price": (
+            minimum_price
+            if minimum_price is not None
+            else unit["price"]
+        ),
+        "note": unit.get("note", ""),
+        "id_shipping_group": 100003,
+        "id_warehouse": 63925,
+        "ean": ean,
+        "id_product": unit["id_product"],
+        "id_offer": str(unit["id_unit"]),
+        "condition": unit["condition"],
+        "vat_indicator": "standard_rate",
+        "eco_participation": 0,
+        "battery_participation": 0,
+        "manufacturer_guarantee_years": 0,
+    }
+    
+    async def post(self, request, ean: str):
+        serializer = self.serializer_class(data=request.data)
+        serializer.is_valid(raise_exception=True)
         
+        validated_data = serializer.validated_data
+        controller = validated_data["controller"]
+        
+        result = {"response": "success", "failed_storefront"}
+        async with aiohttp.ClientSession() as client:
+            rac = RestApiController(controller=contoller, session=client)
+            
+            # Retrieve unit by id from table
+            for storefront in storefronts:
+                try:
+                    saved_unit = await Unit.objects.aget(
+                        ean=ean,
+                        storefront=storefront,
+                        controller=controller
+                    )
+                    
+                    unit_data = saved_unit.unit
+                    
+                    payload = build_payload(unit_data, ean)
+                    
+                    response = rac.send_request(
+                        method="POST",
+                        endpoint=
+                        f"/units"
+                        f"?storefront={storefront}",
+                        json={payload}
+                    )
+                except Exception as error:
+                    result["response"] = "failed"
+
+                    result["failed_storefronts"].append({
+                        "storefront": storefront,
+                        "error": str(error)
+                    })
+        return response 
+
+    

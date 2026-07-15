@@ -6,6 +6,7 @@ import hashlib
 import time
 import logging
 import math
+import inspect
 
 logger = logging.getLogger(__name__)
 
@@ -130,7 +131,8 @@ class RestApiController:
                 return {"status": response.status, "data": None}
 
             try:
-                print(response_text)
+                caller = inspect.stack()[1].function
+                print(caller)
                 return json.loads(response_text)
             except json.JSONDecodeError:
                 print("ERROR HERE")

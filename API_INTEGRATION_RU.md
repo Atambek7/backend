@@ -4,7 +4,7 @@
 
 ## 1) Базовый URL и требования
 
-- Базовый URL (prod): `https://kaufland.automatonsoft.de`
+- Базовый URL (prod): `https://kl.automatonsoft.de`
 - Префикс API: `/api`
 - Авторизация: JWT Bearer (кроме `/api/health/`)
 - Обязательный параметр `controller` в операциях: `jv` или `xl`
@@ -367,7 +367,7 @@ Authorization: Bearer <jwt_access>
 ```python
 import requests
 
-BASE = "https://kaufland.automatonsoft.de"
+BASE = "https://kl.automatonsoft.de"
 
 def get_tokens(username: str, password: str) -> dict:
     r = requests.post(f"{BASE}/api/token/", json={
@@ -401,4 +401,3 @@ def product_by_ean(access: str, ean: str, controller: str = "jv") -> dict:
     r.raise_for_status()
     return r.json()
 ```
-

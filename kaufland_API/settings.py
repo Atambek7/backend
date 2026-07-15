@@ -268,7 +268,12 @@ CHANNEL_LAYERS = {
 }
 
 # Максимальный размер принимаемых файлов для django
-DATA_UPLOAD_MAX_MEMORY_SIZE = 30 * 1024 * 1024  # 30 МБ в байтах
+DATA_UPLOAD_MAX_MEMORY_SIZE = int(
+    os.getenv("DATA_UPLOAD_MAX_MEMORY_SIZE", str(200 * 1024 * 1024))
+)
+FILE_UPLOAD_MAX_MEMORY_SIZE = int(
+    os.getenv("FILE_UPLOAD_MAX_MEMORY_SIZE", str(200 * 1024 * 1024))
+)
 
 SIMPLE_JWT = {
     "ACCESS_TOKEN_LIFETIME": timedelta(weeks=1),
