@@ -6,3 +6,10 @@ npm-debug.log
 logs/
 tmp/
 venv/
+.venv/
+media/
+staticfiles/
+__pycache__/
+*.pyc
+*.pyo
+*.log

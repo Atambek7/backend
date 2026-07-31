@@ -461,162 +461,192 @@ class PutProductView(APIView):
     
     async def get(self, request):
         return Response({"method": "GET", "message": "ok"}, status=status.HTTP_200_OK)
-    
-    
-    async def put(self, request):
-        serializer = self.serializer_class(data=request.data)
-        try:
-            serializer.is_valid(raise_exception=True)
-        except ValidationError as ve:
-            return Response({"error": str(ve)}, status=status.HTTP_400_BAD_REQUEST)
-        
-        validated_data = serializer.validated_data
-        
-        result = {
-            "data": {},
-            "errors": {},
-            "success": False,
-        }
-        
-        # Main body
-        ean = validated_data["ean"]
-        controller = validated_data["controller"]
-        
-        price = int(validated_data["price"])
-        size = validated_data["size"]
-        color = validated_data["color"]
-        material = validated_data["material"]
-        delivery = validated_data["delivery"]
-        
-        height = validated_data["height"]
-        length = validated_data["length"]
-        width = validated_data["width"]
-        
-        # Attributes
-        attributes = {
-            "title": [validated_data["title"]],
-            "description": [validated_data["description"]],
-            "picture": validated_data["picture"],
-            "product_safety_contact": get_product_safety_contact(controller) 
-        }
-        
-        # Short description generation
-        try: 
-            seo_list = await generate_seo(
-                article=attributes["title"][0],
-                size = size,
-                color = color,
-                material = material
-            )
-        except Exception as e:
-            result["errors"] = {"gtp_error": str(e)}
-            seo_list = []
-            
-        attributes["short_description"] = seo_list
-        
+
+    @staticmethod
+    def _material_value(material: str) -> str:
+        value = str(material).strip()
+        if value in ["Stoff", "Textil"]:
+            return "Synthetic"
+        return value
+
+    @staticmethod
+    def _parse_existing_offer_error(error: Exception) -> bool:
+        return "already exists" in str(error).lower()
+
+    async def _select_category(
+        self,
+        rac: RestApiController,
+        *,
+        title: str,
+        description: str,
+        manufacturer: str,
+        price: float,
+    ) -> tuple[str, str, dict]:
         category_selector_data = {
             "item": {
-                "title": attributes["title"][0],
-                "description": attributes["description"][0],
-                "manufacturer": "AEA GmbH & Co. KG" if controller == "jv" else "XL MOEBEL GmbH",
+                "title": title,
+                "description": description,
+                "manufacturer": manufacturer,
             },
-            "price": price
+            "price": price,
         }
-        
-        # Category selector
-        async with aiohttp.ClientSession() as client:
-            try:
-                rac = RestApiController(controller, client)
-                endpoint = "/categories/decide?storefront=de&locale=de-DE"
-                response = await rac.send_request("POST", endpoint, json=category_selector_data)
-            except Exception as e:
-                print(f"Exception {str(e)} happend: {type(e).__name__}, args: {e.args}")
-                return Response({"success": False, "data": {"category": {"status": "failed"}}, "errors": str(e)})
-            
-            category_name = response["data"][0]["name"]
-            category_id = response["data"][0]["id_category"]
-            result["data"]["category"] = category_name
-            result["success"] = True
+        response = await rac.send_request(
+            "POST",
+            "/categories/decide?storefront=de&locale=de-DE",
+            json=category_selector_data,
+        )
+        categories = response.get("data") if isinstance(response, dict) else None
+        if not categories:
+            raise ValueError("Kaufland did not return category suggestions")
 
-        attributes["category"] = [category_name]
-        attributes["category_detail"] = {
-            "id": category_id,
-            "title": category_name,
-            "name": category_name,
-        }
-        formatted_width = format_si_dimension(width)
-        formatted_length = format_si_dimension(length)
-        formatted_height = format_si_dimension(height)
-        if formatted_width:
-            attributes["width"] = formatted_width
-        if formatted_length:
-            attributes["length"] = formatted_length
-        if formatted_height:
-            attributes["height"] = formatted_height
-        attributes["material"] = material
-        attributes["colour"] = color
-        attributes["size"] = size
-        attributes["manufacturer_number"] = "JVM" + str(ean)
-        
-        # Product data creation
-        product_data = {
-            "ean": ean,
-            "attributes": attributes,
-        }
-        async with aiohttp.ClientSession() as client:
-            try:
-                rac = RestApiController(controller, client)
-                endpoint = "/product-data?locale=de-DE"
-                response = await rac.send_request("PUT", endpoint, json=product_data)
+        category = categories[0]
+        category_id = category.get("id_category")
+        category_name = category.get("name")
+        if not category_id or not category_name:
+            raise ValueError(f"Invalid Kaufland category response: {response}")
 
-            except Exception as e:
-                return Response({"success": False, "data": {"product": {"status": "failed"}}, "errors": str(e)})
-            
-        result["data"]["product-data"] = response
-        result["success"] = True
-        
-        # Unit creation
+        return str(category_id), str(category_name), response
+
+    async def _fetch_unit_id(
+        self,
+        rac: RestApiController,
+        *,
+        ean: str,
+        storefront: str,
+    ) -> str | None:
+        response = await rac.send_request(
+            method="GET",
+            endpoint=f"/products/ean/{ean}?storefront={storefront}&embedded=units",
+        )
+        data = response.get("data") if isinstance(response, dict) else None
+        units = data.get("units") if isinstance(data, dict) else None
+        if not units:
+            return None
+        return units[0].get("id_unit")
+
+    async def _create_or_update_unit(
+        self,
+        rac: RestApiController,
+        *,
+        ean: str,
+        storefront: str,
+        price: float,
+        delivery: int,
+        amount: int,
+        id_offer: str,
+    ) -> dict:
+        price_payload = rac.make_price_payload(storefront=storefront, price=price)
         unit_data = {
-            "amount": 20,
+            "amount": amount,
             "handling_time": delivery,
-            "listing_price": price,
-            "minimum_price": price,
-            "ean": ean,
-            "id_offer": ean,
-            "condition": "NEW"
+            "listing_price": price_payload["listing_price"],
+            "minimum_price": price_payload["minimum_price"],
+            "ean": str(ean),
+            "id_offer": str(id_offer),
+            "condition": "NEW",
         }
-        async with aiohttp.ClientSession() as client:
-            rac = RestApiController(controller, client)
-            for storefront in storefronts:
-                try:
-                    endpoint = f"/units?storefront={storefront}&embedded=eco_participation"
-                    response = await rac.send_request("POST", endpoint, json=unit_data)
-                    
-                except Exception as e:
-                    offer = result.setdefault("data", {}).setdefault("offer", {})
-                    statuses = offer.setdefault("statuses", {})
-                    if "already exists" in str(e):
-                        statuses[storefront] = "already exists"
-                    continue
-                
-                offer = result.setdefault("data", {}).setdefault("offer", {})
-                statuses = offer.setdefault("statuses", {})
-                statuses[storefront] = "created"
 
-        result["send_data"] = product_data
-        print(result)
-        
-        if len(result["data"]["offer"]["statuses"]) == 7 and all([status == "created" for status in result["data"]["offer"]["statuses"].values()]):
-            result["data"]["offer"] = {**result.get("data", {}).get("offer", {}), "status": "success"}
-            return Response({"result": result}, status=status.HTTP_201_CREATED)
-        
-        elif len(result["data"]["offer"]["statuses"]) != 7 and all([status == "created" for status in result["data"]["offer"]["statuses"].values()]):
-            result["data"]["offer"] = {**result.get("data", {}).get("offer", {}), "status": "partial success"}
-            return Response({"result": result, "completed": "partial"}, status=status.HTTP_201_CREATED)
-        
-        else:
-            result["data"]["offer"] = {**result.get("data", {}).get("offer", {}), "status": "failed"}
-            return Response({"result": result, "completed": "none"}, status=status.HTTP_422_UNPROCESSABLE_ENTITY)
+        try:
+            response = await rac.send_request(
+                "POST",
+                f"/units?storefront={storefront}&embedded=eco_participation",
+                json=unit_data,
+            )
+            return {
+                "status": "created",
+                "request": unit_data,
+                "response": response,
+            }
+        except Exception as exc:
+            if not self._parse_existing_offer_error(exc):
+                return {
+                    "status": "failed",
+                    "request": unit_data,
+                    "error": str(exc),
+                }
+
+            unit_id = await self._fetch_unit_id(
+                rac,
+                ean=ean,
+                storefront=storefront,
+            )
+            if not unit_id:
+                return {
+                    "status": "failed",
+                    "request": unit_data,
+                    "error": "Offer already exists, but unit id was not found",
+                }
+
+            patch_response = await rac.send_request(
+                "PATCH",
+                f"/units/{unit_id}?storefront={storefront}",
+                json=price_payload,
+            )
+            return {
+                "status": "updated",
+                "unit_id": unit_id,
+                "request": price_payload,
+                "response": patch_response,
+            }
+
+    async def _upsert_product(self, request):
+        serializer = self.serializer_class(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        validated_data = serializer.validated_data
+        controller = validated_data["controller"]
+        pictures = validated_data["picture"]
+        upload_item = {
+            "article": validated_data["title"],
+            "price": float(validated_data["price"]),
+            "I_stammartikel": "",
+            "pic_main": pictures[0],
+            "pics": pictures[1:],
+            "ean": str(validated_data["ean"]),
+            "fabric": "",
+            "size": validated_data["size"],
+            "color": validated_data["color"],
+            "height": validated_data["height"],
+            "length": validated_data["length"],
+            "width": validated_data["width"],
+            "material": validated_data["material"],
+            "number_of_units": "",
+            "amount": validated_data["amount"],
+            "id_offer": validated_data["id_offer"],
+            "storefronts": validated_data["storefronts"],
+        }
+
+        async with aiohttp.ClientSession() as session:
+            kaufland_controller = KauflandController(session, controller)
+            uploaded = await kaufland_controller.upload_single_product(upload_item)
+
+        if uploaded:
+            return Response(
+                {
+                    "success": True,
+                    "message": "product uploaded",
+                    "ean": upload_item["ean"],
+                    "controller": controller,
+                },
+                status=status.HTTP_201_CREATED,
+            )
+
+        return Response(
+            {
+                "success": False,
+                "message": "product upload failed",
+                "reason": kaufland_controller.last_upload_error,
+                "ean": upload_item["ean"],
+                "controller": controller,
+            },
+            status=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        )
+
+    async def post(self, request):
+        return await self._upsert_product(request)
+
+    async def put(self, request):
+        return await self._upsert_product(request)
 
 
 class DeactivateProductView(APIView):
@@ -629,6 +659,7 @@ class DeactivateProductView(APIView):
         serializer.is_valid(raise_exception=True)
 
         controller = serializer.validated_data["controller"]
+        log(f"deactivate product start ean={ean} controller={controller}")
 
         result = {
             "response": [],
@@ -642,16 +673,30 @@ class DeactivateProductView(APIView):
             )
             for storefront in storefronts:
                 try:
+                    log(
+                        f"deactivate product fetch units ean={ean} controller={controller} storefront={storefront}"
+                    )
                     get_response = await rac.send_request(
                         method="GET",
                         endpoint=(
-                            f"/product/ean/{ean}"
+                            f"/products/ean/{ean}"
                             f"?storefront={storefront}&embedded=units"
                         ),
                     )
-                    units = get_response["data"]["units"]
+                    data = get_response.get("data") or {}
+                    units = data.get("units") or []
+
+                    if "units" not in data:
+                        log(
+                            f"deactivate product units key missing ean={ean} controller={controller} storefront={storefront} data_keys={sorted(data.keys())}",
+                            level="warning",
+                        )
 
                     if not units:
+                        log(
+                            f"deactivate product units not found ean={ean} controller={controller} storefront={storefront}",
+                            level="warning",
+                        )
                         result["failed_storefronts"].append({
                             "storefront": storefront,
                             "error": "Units not found",
@@ -660,6 +705,9 @@ class DeactivateProductView(APIView):
 
                     unit_data = units[0]
                     unit_id = unit_data["id_unit"]
+                    log(
+                        f"deactivate product delete unit ean={ean} controller={controller} storefront={storefront} unit_id={unit_id}"
+                    )
 
                     delete_response = await rac.send_request(
                         method="DELETE",
@@ -667,6 +715,10 @@ class DeactivateProductView(APIView):
                     )
 
                     if delete_response["status"] != 204:
+                        log(
+                            f"deactivate product unexpected status ean={ean} controller={controller} storefront={storefront} unit_id={unit_id} status={delete_response.get('status')}",
+                            level="warning",
+                        )
                         result["failed_storefronts"].append({
                             "storefront": storefront,
                             "error": f"Unexpected status",
@@ -686,58 +738,168 @@ class DeactivateProductView(APIView):
                         "storefront": storefront,
                         "unit": unit_data,
                     })
+                    log(
+                        f"deactivate product success ean={ean} controller={controller} storefront={storefront} unit_id={unit_id}"
+                    )
 
                 except Exception as error:
+                    log(
+                        f"deactivate product failed ean={ean} controller={controller} storefront={storefront} error_type={type(error).__name__} error={error}",
+                        level="error",
+                    )
                     result["failed_storefronts"].append({
                         "storefront": storefront,
                         "error": str(error),
                     })
+            log(
+                f"deactivate product finished ean={ean} controller={controller} success_count={len(result['response'])} failed_count={len(result['failed_storefronts'])}"
+            )
             return Response(result)
 
 
 class ActivateProductView(APIView):
     serializer_class = ActivateProductSerializer
     permission_classes = [AllowAny]
-    
-    
-    
-    def build_payload(self, unit: dict, ean: str):
-        return {
-        "amount": unit["amount"],
-        "handling_time": unit.get("delivery_time_min", 0),
-        "listing_price": unit["price"],
-        "minimum_price": (
-            minimum_price
-            if minimum_price is not None
-            else unit["price"]
-        ),
-        "note": unit.get("note", ""),
-        "id_shipping_group": 100003,
-        "id_warehouse": 63925,
-        "ean": ean,
-        "id_product": unit["id_product"],
-        "id_offer": str(unit["id_unit"]),
-        "condition": unit["condition"],
-        "vat_indicator": "standard_rate",
-        "eco_participation": 0,
-        "battery_participation": 0,
-        "manufacturer_guarantee_years": 0,
-    }
+
+    @staticmethod
+    def _normalize_name(value):
+        return str(value or "").strip().casefold()
+
+    @staticmethod
+    def _get_response_items(response: dict) -> list[dict]:
+        data = response.get("data") if isinstance(response, dict) else None
+        return data if isinstance(data, list) else []
+
+    async def _fetch_all(self, rac: RestApiController, endpoint: str) -> list[dict]:
+        items = []
+        limit = 30
+        offset = 0
+
+        while True:
+            separator = "&" if "?" in endpoint else "?"
+            response = await rac.send_request(
+                method="GET",
+                endpoint=f"{endpoint}{separator}limit={limit}&offset={offset}",
+            )
+            chunk = self._get_response_items(response)
+            items.extend(chunk)
+
+            if len(chunk) < limit:
+                return items
+            offset += limit
+
+    async def _fetch_warehouse_map(self, rac: RestApiController) -> dict:
+        warehouses = await self._fetch_all(rac, "/warehouses")
+        by_name = {
+            self._normalize_name(item.get("name")): item.get("id_warehouse")
+            for item in warehouses
+            if item.get("name") and item.get("id_warehouse")
+        }
+        default_id = next(
+            (
+                item.get("id_warehouse")
+                for item in warehouses
+                if item.get("is_default") and item.get("id_warehouse")
+            ),
+            None,
+        )
+        return {"by_name": by_name, "default_id": default_id}
+
+    async def _fetch_shipping_group_map(
+        self, rac: RestApiController, storefront: str
+    ) -> dict:
+        groups = await self._fetch_all(rac, f"/shipping-groups?storefront={storefront}")
+        by_name = {
+            self._normalize_name(item.get("name")): item.get("id_shipping_group")
+            for item in groups
+            if item.get("name") and item.get("id_shipping_group")
+        }
+        default_id = next(
+            (
+                item.get("id_shipping_group")
+                for item in groups
+                if item.get("is_default") and item.get("id_shipping_group")
+            ),
+            None,
+        )
+        return {"by_name": by_name, "default_id": default_id}
+
+    def _resolve_warehouse_id(self, unit: dict, warehouse_map: dict):
+        existing_id = unit.get("id_warehouse")
+        if existing_id:
+            return existing_id
+
+        warehouse_name = self._normalize_name(unit.get("warehouse"))
+        if warehouse_name:
+            warehouse_id = warehouse_map["by_name"].get(warehouse_name)
+            if warehouse_id:
+                return warehouse_id
+
+        return warehouse_map["default_id"]
+
+    def _resolve_shipping_group_id(self, unit: dict, shipping_group_map: dict):
+        existing_id = unit.get("id_shipping_group")
+        if existing_id:
+            return existing_id
+
+        shipping_group_name = self._normalize_name(unit.get("shipping_group"))
+        if shipping_group_name:
+            shipping_group_id = shipping_group_map["by_name"].get(shipping_group_name)
+            if shipping_group_id:
+                return shipping_group_id
+
+        return shipping_group_map["default_id"]
+
+    def build_payload(
+        self,
+        unit: dict,
+        ean: str,
+        warehouse_id=None,
+        shipping_group_id=None,
+    ):
+        minimum_price = unit.get("minimum_price")
+
+        payload = {
+            "amount": unit["amount"],
+            "handling_time": unit.get("delivery_time_min", 0),
+            "listing_price": unit["price"],
+            "minimum_price": minimum_price if minimum_price is not None else unit["price"],
+            "note": unit.get("note", ""),
+            "ean": ean,
+            "id_product": unit["id_product"],
+            "id_offer": str(unit.get("id_offer") or ean),
+            "condition": unit["condition"],
+            "vat_indicator": "standard_rate",
+        }
+
+        if warehouse_id:
+            payload["id_warehouse"] = warehouse_id
+        if shipping_group_id:
+            payload["id_shipping_group"] = shipping_group_id
+
+        return payload
     
     async def post(self, request, ean: str):
         serializer = self.serializer_class(data=request.data)
         serializer.is_valid(raise_exception=True)
-        
+
         validated_data = serializer.validated_data
         controller = validated_data["controller"]
-        
-        result = {"response": "success", "failed_storefront"}
+        log(f"activate product start ean={ean} controller={controller}")
+
+        result = {"response": [], "failed_storefronts": []}
+
         async with aiohttp.ClientSession() as client:
-            rac = RestApiController(controller=contoller, session=client)
+            rac = RestApiController(controller=controller, session=client)
+            warehouse_map = await self._fetch_warehouse_map(rac)
+            shipping_group_maps = {}
             
             # Retrieve unit by id from table
             for storefront in storefronts:
                 try:
+                    log(
+                        f"activate product fetch saved unit ean={ean} controller={controller} storefront={storefront}"
+                    )
                     saved_unit = await Unit.objects.aget(
                         ean=ean,
                         storefront=storefront,
@@ -745,23 +907,59 @@ class ActivateProductView(APIView):
                     )
                     
                     unit_data = saved_unit.unit
+                    shipping_group_maps[storefront] = (
+                        shipping_group_maps.get(storefront)
+                        or await self._fetch_shipping_group_map(rac, storefront)
+                    )
+                    warehouse_id = self._resolve_warehouse_id(
+                        unit_data, warehouse_map
+                    )
+                    shipping_group_id = self._resolve_shipping_group_id(
+                        unit_data, shipping_group_maps[storefront]
+                    )
+
+                    if not warehouse_id:
+                        raise ValueError(
+                            f"Warehouse not found for saved warehouse={unit_data.get('warehouse')!r}"
+                        )
+                    if not shipping_group_id:
+                        raise ValueError(
+                            f"Shipping group not found for saved shipping_group={unit_data.get('shipping_group')!r}"
+                        )
+
+                    payload = self.build_payload(
+                        unit_data,
+                        ean,
+                        warehouse_id=warehouse_id,
+                        shipping_group_id=shipping_group_id,
+                    )
+                    log(
+                        f"activate product create unit ean={ean} controller={controller} storefront={storefront} old_unit_id={unit_data.get('id_unit')} warehouse={unit_data.get('warehouse')} id_warehouse={warehouse_id} shipping_group={unit_data.get('shipping_group')} id_shipping_group={shipping_group_id}"
+                    )
                     
-                    payload = build_payload(unit_data, ean)
-                    
-                    response = rac.send_request(
+                    response = await rac.send_request(
                         method="POST",
-                        endpoint=
-                        f"/units"
-                        f"?storefront={storefront}",
-                        json={payload}
+                        endpoint=f"/units?storefront={storefront}&embedded=eco_participation",
+                        json=payload,
+                    )
+                    result["response"].append({
+                        "storefront": storefront,
+                        "response": response,
+                    })
+                    log(    
+                        f"activate product success ean={ean} controller={controller} storefront={storefront} old_unit_id={unit_data.get('id_unit')}"
                     )
                 except Exception as error:
-                    result["response"] = "failed"
+                    log(
+                        f"activate product failed ean={ean} controller={controller} storefront={storefront} error_type={type(error).__name__} error={error}",
+                        level="error",
+                    )
 
                     result["failed_storefronts"].append({
                         "storefront": storefront,
                         "error": str(error)
                     })
-        return response 
-
-    
+        log(
+            f"activate product finished ean={ean} controller={controller} success_count={len(result['response'])} failed_count={len(result['failed_storefronts'])}"
+        )
+        return Response(result)

@@ -145,6 +145,7 @@ class KauflandController:
         self.aftercool_base_url = "https://aftercool.de"
         self.aftercool_failures = 0
         self.aftercool_circuit_open_until = 0.0
+        self.last_upload_error = None
 
     def _aftercool_circuit_open(self) -> bool:
         return time.monotonic() < self.aftercool_circuit_open_until
@@ -162,6 +163,11 @@ class KauflandController:
                 save=True,
                 level="warning",
             )
+
+    def _fail_upload(self, reason: str, *, level: str = "error") -> bool:
+        self.last_upload_error = reason
+        log(reason, save=True, level=level)
+        return False
 
     @staticmethod
     def _as_scalar_string(value: Any) -> str | None:
@@ -514,40 +520,103 @@ class KauflandController:
         self._ean_cache["product_ids"][ean] = final_res
         return final_res
 
-    async def _add_unit_id(self, ean, price, delivery, target_storefronts=None):
+    @staticmethod
+    def _is_offer_already_exists_response(result: Any) -> bool:
+        return "already exists" in json.dumps(
+            result,
+            ensure_ascii=False,
+            default=str,
+        ).lower()
+
+    async def _patch_unit_payload(self, storefront, price, delivery=None, amount=None):
+        formatted_price = await self._make_price(storefront=storefront, price=price)
+        payload = {
+            "listing_price": formatted_price,
+            "minimum_price": formatted_price,
+        }
+        if delivery is not None:
+            payload["handling_time"] = delivery
+        if amount is not None:
+            payload["amount"] = amount
+        return payload
+
+    async def _add_unit_id(
+        self,
+        ean,
+        price,
+        delivery,
+        target_storefronts=None,
+        id_offer=None,
+        amount=20,
+    ):
         """
         Create a unit for a product in Kaufland.
         """
         if target_storefronts is None:
             target_storefronts = storefronts
+        id_offer = str(id_offer or ean)
 
         async def add_unit_for_storefront(storefront):
             url = f"{self.base_api_url}/units?storefront={storefront}&embedded=eco_participation"
             formatted_price = await self._make_price(storefront=storefront, price=price)
 
             body = {
-                "amount": 20,
+                "amount": amount,
                 "handling_time": delivery,
                 "listing_price": formatted_price,
+                "minimum_price": formatted_price,
                 "ean": str(ean),
-                "id_offer": f"{ean}",
+                "id_offer": id_offer,
                 "condition": "NEW",
             }
 
             result = await self._universal_request("POST", url, body=body)
             if not isinstance(result, dict):
-                log(
-                    f"add_unit failed ean={ean} storefront={storefront} response_type={type(result).__name__}",
+                return self._fail_upload(
+                    f"add_unit failed ean={ean} storefront={storefront} response_type={type(result).__name__}"
                 )
-                return False
 
             data = result.get("data") or {}
             if data.get("status", "") == "AVAILABLE":
                 return True
-            log(
-                f"add_unit failed ean={ean} storefront={storefront} response={result} body={json.dumps(body, ensure_ascii=False)}",
+
+            if self._is_offer_already_exists_response(result):
+                self._ean_cache["unit_ids"].pop(ean, None)
+                unit_ids = await self._fetch_unit_id_by_ean(ean)
+                unit_id = unit_ids.get(storefront) if isinstance(unit_ids, dict) else None
+                if not unit_id:
+                    return self._fail_upload(
+                        f"add_unit offer exists but unit_id not found ean={ean} storefront={storefront} id_offer={id_offer} response={result}",
+                    )
+
+                patch_url = f"{self.base_api_url}/units/{unit_id}?storefront={storefront}&embedded=eco_participation"
+                patch_payload = await self._patch_unit_payload(
+                    storefront=storefront,
+                    price=price,
+                    delivery=delivery,
+                    amount=amount,
+                )
+                patch_result = await self._universal_request(
+                    method="PATCH",
+                    url=patch_url,
+                    body=patch_payload,
+                )
+                patched = patch_result.get("message") in {"success", "not found"}
+                if not patched:
+                    self.last_upload_error = (
+                        f"patch existing offer failed ean={ean} storefront={storefront} "
+                        f"id_offer={id_offer} unit_id={unit_id} response={patch_result}"
+                    )
+                log(
+                    f"add_unit existing offer patched ean={ean} storefront={storefront} id_offer={id_offer} unit_id={unit_id} patched={patched}",
+                    save=True,
+                    level="info" if patched else "error",
+                )
+                return patched
+
+            return self._fail_upload(
+                f"add_unit failed ean={ean} storefront={storefront} response={result} body={json.dumps(body, ensure_ascii=False)}"
             )
-            return False
 
         bool_list = await asyncio.gather(
             *(add_unit_for_storefront(storefront) for storefront in target_storefronts)
@@ -753,6 +822,8 @@ class KauflandController:
         ean,
         price,
         new_unit_id: dict[str, str] | None = None,
+        delivery=None,
+        amount=None,
     ):
         """
         Update product price by unit_id.
@@ -768,8 +839,12 @@ class KauflandController:
             bool_list = []
             for storefront, unit_id in final_res.items():
                 url = f"{self.base_api_url}/units/{unit_id}?storefront={storefront}&embedded=eco_participation"
-                total_price = await self._make_price(storefront=storefront, price=price)
-                payload = {"listing_price": total_price}
+                payload = await self._patch_unit_payload(
+                    storefront=storefront,
+                    price=price,
+                    delivery=delivery,
+                    amount=amount,
+                )
 
                 result = await self._universal_request(
                     method="PATCH", url=url, body=payload
@@ -783,6 +858,11 @@ class KauflandController:
                     bool_list.append(True)
 
                 else:
+                    self.last_upload_error = (
+                        f"update unit failed ean={ean} storefront={storefront} "
+                        f"unit_id={unit_id} response={result} payload={payload}"
+                    )
+                    log(self.last_upload_error, save=True, level="error")
                     bool_list.append(False)
 
             return all(bool_list)
@@ -960,25 +1040,24 @@ class KauflandController:
         ean = elem.get("ean")
 
         log(f"start upload item ean={ean}", save=True, level="info")
+        self.last_upload_error = None
         if await is_cancelled(job_id):
-            log(f"upload cancelled before validation ean={ean} job_id={job_id}", save=True, level="warning")
-            return False
+            return self._fail_upload(
+                f"upload cancelled before validation ean={ean} job_id={job_id}",
+                level="warning",
+            )
 
         if not ean:
-            log(f"ERROR WITH EAN: elem: {elem}")
-            return False
+            return self._fail_upload(f"ERROR WITH EAN: elem: {elem}")
 
         elif not elem.get("article"):
-            log(f"ERROR WITH ARTICLE: elem: {elem}")
-            return False
+            return self._fail_upload(f"ERROR WITH ARTICLE: elem: {elem}")
 
         elif elem.get("price", 0) < 30:
-            log(f"ERROR WITH PRICE: elem: {elem}")
-            return False
+            return self._fail_upload(f"ERROR WITH PRICE: elem: {elem}")
 
         elif not elem.get("pic_main"):
-            log(f"ERROR WITH PIC: elem: {elem}")
-            return False
+            return self._fail_upload(f"ERROR WITH PIC: elem: {elem}")
 
         log(
             f"validation passed ean={ean} article_present={bool(elem.get('article'))} price={elem.get('price')} pic_main_present={bool(elem.get('pic_main'))}",
@@ -991,6 +1070,9 @@ class KauflandController:
         color = elem["color"]
         material = elem["material"]
         price = int(elem["price"])
+        amount = int(elem.get("amount") or 20)
+        id_offer = str(elem.get("id_offer") or ean)
+        target_storefronts = elem.get("storefronts") or storefronts
         total = (
             [elem["pic_main"]] + elem["pics"]
             if len(elem["pics"]) > 0 and elem["pics"][0]
@@ -1193,14 +1275,14 @@ class KauflandController:
             new_webtag = adapt_result
 
         if isinstance(category_result, Exception):
-            log(f"category selection failed ean={ean} error={category_result}", save=True, level="error")
             if not seo_task.done():
                 seo_task.cancel()
-            return False
+            return self._fail_upload(
+                f"category selection failed ean={ean} error={category_result}"
+            )
 
         if isinstance(category_result, BaseException):
-            log("Critical error during category selection", save=True, level="error")
-            return False
+            return self._fail_upload("Critical error during category selection")
 
         category_id, category_name = category_result
         log(
@@ -1210,8 +1292,7 @@ class KauflandController:
         )
 
         if category_id is None:
-            log(f"ERROR WITH CATEGORY ID IS NONE: EAN: {ean}")
-            return False    
+            return self._fail_upload(f"ERROR WITH CATEGORY ID IS NONE: EAN: {ean}")    
 
         try:
             seo_list = await seo_task
@@ -1296,15 +1377,14 @@ class KauflandController:
                 )
 
         except Exception as e:
-            log(
-                f"Request to Kaufland API failed for EAN {ean}: {e}",
-                save=True,
-                level="error",
+            return self._fail_upload(
+                f"Request to Kaufland API failed for EAN {ean}: {e}"
             )
-            return False
 
         if not isinstance(result, dict):
-            return False
+            return self._fail_upload(
+                f"Kaufland product-data returned non-dict response ean={ean} response={result}"
+            )
 
         if result.get("data") == "Content created or replaced":
             try:
@@ -1315,8 +1395,7 @@ class KauflandController:
                     level="info",
                 )
             except Exception as e:
-                log(f"fetch unit_ids failed ean={ean} error={e}", save=True, level="error")
-                return False
+                return self._fail_upload(f"fetch unit_ids failed ean={ean} error={e}")
 
             if unit_ids:
                 log(
@@ -1324,13 +1403,22 @@ class KauflandController:
                     save=True,
                     level="info",
                 )
+                target_unit_ids = {
+                    storefront: unit_id
+                    for storefront, unit_id in unit_ids.items()
+                    if storefront in target_storefronts
+                }
                 update_result = await self._update_price_by_unit_id(
-                    ean, price, unit_ids
+                    ean,
+                    price,
+                    target_unit_ids,
+                    delivery=delivery,
+                    amount=amount,
                 )
 
                 missing_storefronts = [
                     storefront
-                    for storefront in storefronts
+                    for storefront in target_storefronts
                     if storefront not in unit_ids
                 ]
                 add_result = True
@@ -1341,7 +1429,12 @@ class KauflandController:
                         level="info",
                     )
                     add_result = await self._add_unit_id(
-                        ean, price, delivery, target_storefronts=missing_storefronts
+                        ean,
+                        price,
+                        delivery,
+                        target_storefronts=missing_storefronts,
+                        id_offer=id_offer,
+                        amount=amount,
                     )
 
                 overall_result = update_result and add_result
@@ -1353,12 +1446,20 @@ class KauflandController:
                 return overall_result
             else:
                 log("Fresh product, adding unit_id...", save=True, level="info")
-                result = await self._add_unit_id(ean, price, delivery)
+                result = await self._add_unit_id(
+                    ean,
+                    price,
+                    delivery,
+                    target_storefronts=target_storefronts,
+                    id_offer=id_offer,
+                    amount=amount,
+                )
                 log(f"final new-product result ean={ean} add_unit_result={result}", save=True, level="info")
                 return result
         else:
-            log(f"Failed to create or replace product for EAN {ean}: {result}", save=True, level="error")
-            return False
+            return self._fail_upload(
+                f"Failed to create or replace product for EAN {ean}: {result}"
+            )
 
     async def delete_all_products(self, eans, job_id: str | None = None):
         """

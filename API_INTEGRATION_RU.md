@@ -275,6 +275,60 @@ Authorization: Bearer <jwt_access>
 
 ---
 
+## 6.3 Выставить товар через внешний endpoint
+
+- **Метод**: `POST` (также поддерживается `PUT` для совместимости)
+- **URL**: `/api/products/upload/`
+- **Content-Type**: `application/json`
+
+Поля:
+- `ean` *(string, required)*: EAN товара.
+- `controller` *(string, required)*: `jv` или `xl`.
+- `title` *(string, required)*: название товара.
+- `description` *(string, required)*: описание товара.
+- `picture` *(array[string URL], required)*: список URL картинок. Можно передать alias `picture_urls`.
+- `price` *(decimal, required)*: базовая цена. Для офферов backend сам конвертирует ее в формат Kaufland для каждого storefront.
+- `size` *(string, required)*: размер.
+- `color` *(string, required)*: цвет.
+- `material` *(string, required)*: материал.
+- `delivery` *(integer, required)*: handling time.
+- `height` *(decimal, required)*: высота.
+- `length` *(decimal, required)*: длина.
+- `width` *(decimal, required)*: ширина.
+- `amount` *(integer, optional, default `20`)*: количество.
+- `id_offer` *(string, optional, default `ean`)*: ID оффера.
+- `storefronts` *(array[string], optional)*: storefronts для офферов. Значения: `de`, `cz`, `sk`, `pl`, `at`, `fr`, `it`. Если не передано, используются все.
+
+Пример:
+
+```json
+{
+  "ean": "1234567890123",
+  "controller": "jv",
+  "title": "Sofa beige",
+  "description": "HTML or plain product description",
+  "picture": ["https://example.com/image-1.jpg"],
+  "price": "199.99",
+  "size": "200x100 cm",
+  "color": "Beige",
+  "material": "Holz",
+  "delivery": 28,
+  "height": "80",
+  "length": "200",
+  "width": "100",
+  "amount": 20,
+  "storefronts": ["de", "at"]
+}
+```
+
+Ответы:
+- `201`: product-data создан/обновлен, все офферы созданы или обновлены.
+- `207`: product-data создан/обновлен, часть офферов создана или обновлена.
+- `422`: product-data создан/обновлен, но офферы не созданы.
+- `502`: ошибка upstream Kaufland на этапе категории или product-data.
+
+---
+
 ## 7) Остановить задачу
 
 - **Метод**: `POST`
