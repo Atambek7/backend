@@ -28,7 +28,7 @@ controllers_base = {
     },
 }
 
-storefronts = ["de", "cz", "sk", "pl", "at", "fr", "it", "nl"]
+storefronts = ["de", "cz", "sk", "pl", "at", "fr", "it", "nl", "es"]
 
 # URL Путь для моей API
 MAIN_HOST = os.getenv("MAIN_HOST")

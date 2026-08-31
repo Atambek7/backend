@@ -423,6 +423,8 @@ class PatchProductView(APIView):
             return "it-IT"
         if storefront == "nl":
             return "nl-NL"
+        if storefront == "es":
+            return "es-ES"
         return "de-DE"
 
 
@@ -438,7 +440,17 @@ class DeleteProductView(APIView):
         
         controller = validated_data["controller"]
         
-        locales = ["de-DE", "cs-CZ", "sk-SK", "de-AT", "pl-PL", "fr-FR", "it-IT"]
+        locales = [
+            "de-DE",
+            "cs-CZ",
+            "sk-SK",
+            "de-AT",
+            "pl-PL",
+            "fr-FR",
+            "it-IT",
+            "nl-NL",
+            "es-ES",
+        ]
         
         async with aiohttp.ClientSession() as client:
             rac = RestApiController(controller=controller, session=client)
