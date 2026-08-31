@@ -297,7 +297,7 @@ Authorization: Bearer <jwt_access>
 - `width` *(decimal, required)*: ширина.
 - `amount` *(integer, optional, default `20`)*: количество.
 - `id_offer` *(string, optional, default `ean`)*: ID оффера.
-- `storefronts` *(array[string], optional)*: storefronts для офферов. Значения: `de`, `cz`, `sk`, `pl`, `at`, `fr`, `it`. Если не передано, используются все.
+- `storefronts` *(array[string], optional)*: storefronts для офферов. Значения: `de`, `cz`, `sk`, `pl`, `at`, `fr`, `it`, `nl`. Если не передано, используются все.
 
 Пример:
 

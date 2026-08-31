@@ -421,6 +421,8 @@ class PatchProductView(APIView):
             return "fr-FR"
         if storefront == "it":
             return "it-IT"
+        if storefront == "nl":
+            return "nl-NL"
         return "de-DE"
 
 
