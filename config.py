@@ -1,7 +1,10 @@
+from __future__ import annotations
 import os
+from pathlib import Path
 from dotenv import load_dotenv
 
-
+BASE_DIR = Path(__file__).resolve().parent
+load_dotenv(dotenv_path=BASE_DIR / ".env")
 load_dotenv()
 
 # Подключение к Базе Данных
@@ -28,7 +31,39 @@ controllers_base = {
     },
 }
 
+storefronts_by_account = {
+    "jv": ["de", "cz", "sk", "pl", "at", "fr", "it", "nl", "es"],
+    "xl": ["de", "cz", "sk", "pl", "at", "fr", "it"],
+}
+
+# Общий список всех витрин (для валидации и обратной совместимости)
 storefronts = ["de", "cz", "sk", "pl", "at", "fr", "it", "nl", "es"]
+
+
+def get_account_storefronts(account: str | None = None) -> list[str]:
+    """
+    Возвращает список поддерживаемых витрин для аккаунта.
+    JV: de, cz, sk, pl, at, fr, it, nl, es.
+    XL: de, cz, sk, pl, at, fr, it (без nl и es).
+    Если аккаунт не указан или неизвестен, возвращает общий список storefronts.
+    """
+    if not account:
+        return list(storefronts)
+    acc = str(account).strip().lower()
+    return list(storefronts_by_account.get(acc, storefronts))
+
+# Базовые URL и учетные данные API
+KAUFLAND_API_BASE_URL = os.getenv("KAUFLAND_API_BASE_URL", "https://sellerapi.kaufland.com/v2")
+AFTERCOOL_BASE_URL = os.getenv("AFTERCOOL_BASE_URL", "http://217.154.165.51:8000/api")
+AFTERCOOL_USERNAME = os.getenv("AFTERCOOL_USERNAME", "Miras")
+AFTERCOOL_PASSWORD = os.getenv("AFTERCOOL_PASSWORD", "Miras112112")
+
+# Курсы валют и надбавки для витрин
+EXCHANGE_RATES = {
+    "PLN": float(os.getenv("EXCHANGE_RATE_PLN", "4.7")),
+    "CZK": float(os.getenv("EXCHANGE_RATE_CZK", "25.4")),
+    "ITP": float(os.getenv("SURCHARGE_IT", "1.05")),
+}
 
 # URL Путь для моей API
 MAIN_HOST = os.getenv("MAIN_HOST")

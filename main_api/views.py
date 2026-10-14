@@ -176,6 +176,9 @@ class MainOperationsView(APIView):
         return Response({"message": "ok"}, status=status.HTTP_200_OK)
 
     async def post(self, request):
+        controller = None
+        mode = None
+        ean = None
         try:
             serializer = FileUploadSerializer(data=request.data)
             if not serializer.is_valid():
@@ -195,16 +198,18 @@ class MainOperationsView(APIView):
                         {"error": "ean is required for checker"},
                         status=status.HTTP_400_BAD_REQUEST,
                     )
-                if not job_id:
-                    job_id = uuid4().hex
-                asyncio.create_task(_run_checker_job(controller, [single_ean], job_id))
+                async with aiohttp.ClientSession() as session:
+                    kaufland_controller = KauflandController(session, controller)
+                    check_result = await kaufland_controller._check_product_by_unit_id(
+                        single_ean, job_id=job_id
+                    )
                 return Response(
                     {
-                        "message": "checker job started",
-                        "job_id": job_id,
-                        "eans": [single_ean],
+                        "controller": controller,
+                        "ean": single_ean,
+                        **check_result,
                     },
-                    status=status.HTTP_202_ACCEPTED,
+                    status=status.HTTP_200_OK,
                 )
 
             filename = file.name.lower()

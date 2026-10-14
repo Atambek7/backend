@@ -40,7 +40,7 @@ class NLStorefrontTestCase(TestCase):
     def test_put_data_serializer_accepts_nl(self):
         """Проверяем, что PutDataSerializer валидирует список витрин с 'nl'."""
         payload = {
-            "ean": "4000000000000",
+            "ean": "4069943370027",
             "controller": "jv",
             "title": "Test Product",
             "description": "Test description",

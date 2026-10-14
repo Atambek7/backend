@@ -282,7 +282,7 @@ Authorization: Bearer <jwt_access>
 - **Content-Type**: `application/json`
 
 Поля:
-- `ean` *(string, required)*: EAN товара.
+- `ean` *(string, required)*: EAN товара (валидный штрихкод с контрольной суммой EAN-13/GS1).
 - `controller` *(string, required)*: `jv` или `xl`.
 - `title` *(string, required)*: название товара.
 - `description` *(string, required)*: описание товара.
@@ -290,42 +290,61 @@ Authorization: Bearer <jwt_access>
 - `price` *(decimal, required)*: базовая цена. Для офферов backend сам конвертирует ее в формат Kaufland для каждого storefront.
 - `size` *(string, required)*: размер.
 - `color` *(string, required)*: цвет.
-- `material` *(string, required)*: материал.
+- `material` *(string, required)*: материал **строго на немецком языке** (например: `Holz`, `Sperrholz`, `Textil`, `Leder`, `Metall`, `Kunststoff`). Кириллица запрещена и вызывает ошибку 400.
+- `material_composition` *(string, optional)*: процентный состав текстиля/обивки (например: `100% Polyester`, `100% Leder`). Обязателен для мягкой мебели/стульев/диванов по регламенту ЕС. Не передавайте фиктивные строки вроде `"No information required"`.
 - `delivery` *(integer, required)*: handling time.
 - `height` *(decimal, required)*: высота.
 - `length` *(decimal, required)*: длина.
 - `width` *(decimal, required)*: ширина.
 - `amount` *(integer, optional, default `20`)*: количество.
 - `id_offer` *(string, optional, default `ean`)*: ID оффера.
-- `storefronts` *(array[string], optional)*: storefronts для офферов. Значения: `de`, `cz`, `sk`, `pl`, `at`, `fr`, `it`, `nl`, `es`. Если не передано, используются все.
+- `storefronts` *(array[string], optional)*: storefronts для офферов. Значения: `de`, `cz`, `sk`, `pl`, `at`, `fr`, `it`. Если не передано, используются все.
 
 Пример:
 
 ```json
 {
-  "ean": "1234567890123",
+  "ean": "4071489790597",
   "controller": "jv",
-  "title": "Sofa beige",
-  "description": "HTML or plain product description",
-  "picture": ["https://example.com/image-1.jpg"],
-  "price": "199.99",
-  "size": "200x100 cm",
+  "title": "Bürosessel Beige 70x70x100 cm",
+  "description": "Exquisiter Bürosessel in edlem Beige mit Metallgestell.",
+  "picture": ["https://kl.automatonsoft.de/upload-images/example.jpg"],
+  "price": "899.00",
+  "size": "70x70x100 cm",
   "color": "Beige",
   "material": "Holz",
+  "material_composition": "100% Polyester",
   "delivery": 28,
-  "height": "80",
-  "length": "200",
-  "width": "100",
+  "height": "100",
+  "length": "70",
+  "width": "70",
   "amount": 20,
   "storefronts": ["de", "at"]
 }
 ```
 
 Ответы:
-- `201`: product-data создан/обновлен, все офферы созданы или обновлены.
-- `207`: product-data создан/обновлен, часть офферов создана или обновлена.
-- `422`: product-data создан/обновлен, но офферы не созданы.
-- `502`: ошибка upstream Kaufland на этапе категории или product-data.
+- `201 Created`: товар и офферы успешно созданы/обновлены в Kaufland.
+- `400 Bad Request`: ошибка валидации входных данных до отправки в Kaufland (неверный EAN, кириллица в `material`, фиктивный `material_composition`). Возвращает структурированный объект `errors` с пояснением каждого поля.
+- `422 Unprocessable Entity`: product-data или unit отклонен Kaufland (с указанием точной причины в поле `reason`).
+- `502 Bad Gateway`: ошибка upstream Kaufland на этапе связи с маркетплейсом.
+
+Пример ответа 400 при ошибке:
+```json
+{
+  "success": false,
+  "message": "Product validation failed before Kaufland submission",
+  "errors": {
+    "material": [
+      "Material must be specified in German. Received Cyrillic value: 'фанера'. Allowed examples: 'Holz', 'Sperrholz', 'Textil', 'Leder', 'Metall', 'Kunststoff'."
+    ],
+    "material_composition": [
+      "Invalid value. Kaufland rejects placeholder values like 'No information required'. Provide a valid fiber composition (e.g. '100% Polyester', '100% Leder') or omit the field."
+    ]
+  },
+  "ean": "4071489790597"
+}
+```
 
 ---
 
@@ -454,4 +473,142 @@ def product_by_ean(access: str, ean: str, controller: str = "jv") -> dict:
     )
     r.raise_for_status()
     return r.json()
+
+def check_product_status(ean: str, controller: str = "jv", storefront: str = "de") -> dict:
+    """
+    Проверка реального статуса публикации и валидации одиночного товара на Kaufland.
+    Возвращает статус (LIVE / BLOCKED / PENDING / NOT_FOUND), флаг is_live,
+    атрибуты карточки и список обнаруженных ошибок/причин блокировки (issues_detected).
+    """
+    r = requests.get(
+        f"{BASE}/api/products/status/{ean}/",
+        params={"controller": controller, "storefront": storefront},
+        timeout=30,
+    )
+    return r.json()
 ```
+
+---
+
+## 13) Проверка статуса и валидации товара на Kaufland (Одиночная проверка)
+
+Эндпоинт предназначен для сторонних проектов, создающих товары через `KAUFLAND_API_CREATE_ENDPOINT=/api/products/upload/` и `KAUFLAND_API_UPDATE_ENDPOINT=/api/products/ean/change/`, чтобы проверить реальное состояние товара без ручного входа в Seller Portal.
+
+- **Метод**: `GET`
+- **URL**: 
+  - `/api/products/status/{ean}/?controller=jv`
+  - или `/api/products/status/?ean={ean}&controller=jv`
+- **Авторизация**: публичный (AllowAny)
+- **Параметры (Query)**:
+  - `controller` (обязательный): `jv` или `xl`
+  - `storefront` (опционально): `de` (по умолчанию), `pl`, `cz`, `sk`, `at` или `all`
+
+### Возможные статусы (`status`):
+- `LIVE`: Оффер активен на витрине (`is_live: true`), доступен покупателям.
+- `BLOCKED`: Оффер заблокирован (`is_live: false`), найдены ошибки валидации карточки (`is_valid: false`, пустые картинки, кириллица, некорректный состав и т.д.).
+- `PENDING`: Оффер отправлен (`is_live: false`), но явных ошибок атрибутов нет (идет обработка картинок или модерация каталога Kaufland).
+- `NOT_FOUND` (`HTTP 404`): Товар с данным EAN не существует в Kaufland (нет ни офферов, ни карточки).
+
+---
+
+### Пример 1: Товар активен (`LIVE`, HTTP 200)
+
+```json
+{
+  "success": true,
+  "ean": "4069943360264",
+  "controller": "jv",
+  "status": "LIVE",
+  "is_live": true,
+  "is_valid": true,
+  "summary": "Product is LIVE and actively listed for buyers on Kaufland.",
+  "product_url": "https://www.kaufland.de/product/551758076/",
+  "storefronts": {
+    "de": {
+      "is_live": true,
+      "status": "AVAILABLE",
+      "id_unit": 392909971437,
+      "id_offer": "4069943360264",
+      "id_product": 551758076,
+      "price": 2249.0,
+      "amount": 20,
+      "handling_time": 30,
+      "date_inserted": "2026-09-03T15:06:17+02:00",
+      "date_lastchange": "2026-09-07T10:29:53+02:00"
+    }
+  },
+  "attributes": {
+    "title": "Hochbett aus Holz – Ideal für platzsparendes Wohnen und Stauraum.",
+    "manufacturer": "AEA GmbH & Co. KG",
+    "main_picture": "https://media.cdn.kaufland.de/product-images/original/e3814f292e5cf57400c686adab2b2299.jpg",
+    "category_id": 2821,
+    "category": "Laufgitter",
+    "pictures_count": 2,
+    "material": "Textil",
+    "material_composition": "100% Polyester"
+  },
+  "issues_detected": []
+}
+```
+
+---
+
+### Пример 2: Товар заблокирован с ошибками (`BLOCKED`, HTTP 200)
+
+```json
+{
+  "success": true,
+  "ean": "4071489790597",
+  "controller": "jv",
+  "status": "BLOCKED",
+  "is_live": false,
+  "is_valid": false,
+  "summary": "Product is NOT LIVE (is_live: false) due to detected attribute validation issues.",
+  "product_url": "https://www.kaufland.de/product/577536782/",
+  "storefronts": {
+    "de": {
+      "is_live": false,
+      "status": "AVAILABLE",
+      "id_unit": 392964746611,
+      "id_offer": "4071489790597",
+      "id_product": 577536782,
+      "price": 899.0,
+      "amount": 20,
+      "handling_time": 28,
+      "date_inserted": "2026-09-09T12:45:45+02:00",
+      "date_lastchange": "2026-09-09T13:26:45+02:00"
+    }
+  },
+  "attributes": {
+    "title": "Bürosessel Beige",
+    "manufacturer": "AEA",
+    "category_id": 5831
+  },
+  "issues_detected": [
+    "Kaufland product catalog flag 'is_valid' is FALSE (product failed internal validation or requires attribute approval).",
+    "Product has no main image (main_picture is empty on Kaufland).",
+    "Product-data attributes (material, description, composition) not active in Kaufland catalog. Offer is held in draft/need-attributes state."
+  ]
+}
+```
+
+---
+
+### Пример 3: Товар не найден (`NOT_FOUND`, HTTP 404)
+
+```json
+{
+  "success": false,
+  "ean": "1111111111111",
+  "controller": "jv",
+  "status": "NOT_FOUND",
+  "is_live": false,
+  "summary": "Product with EAN 1111111111111 was not found on Kaufland.",
+  "storefronts": {},
+  "attributes": {},
+  "issues_detected": [
+    "Product does not exist in Kaufland catalog (neither product-data, product, nor units found)."
+  ]
+}
+```
+

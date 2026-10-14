@@ -239,7 +239,7 @@ def _normalize_aftercool_html(raw_html: str) -> str:
     Нормализует HTML из Aftercool:
     - декодирует URL-encoding (%0d%0a и т.д.),
     - убирает служебные теги/скрипты,
-    - оставляет контент из основного блока описания.
+    - оставляет контент из основного блока описания с приоритетом детальных характеристик.
     """
     if not raw_html:
         return ""
@@ -252,11 +252,7 @@ def _normalize_aftercool_html(raw_html: str) -> str:
     for tag in soup.find_all(["script", "style", "link", "meta", "noscript"]):
         tag.decompose()
 
-    candidate = (
-        soup.find("div", id="tab-content1")
-        or soup.find("div", class_="panel-body")
-        or _find_fallback_description(soup)
-    )
+    candidate = _find_fallback_description(soup)
 
     if candidate:
         inner_html = "".join(str(child) for child in candidate.contents).strip()
@@ -270,24 +266,40 @@ def _normalize_aftercool_html(raw_html: str) -> str:
 
 
 def _find_fallback_description(soup: BeautifulSoup):
-    # 1) New template: card with "Produktbeschreibung" header
-    for header in soup.find_all(["h2", "h3"]):
+    # 1) Tabs & Details panels (самый точный источник характеристик и описания в шаблонах Afterbuy/Aftercool)
+    for selector in [
+        ".tabs__panel--details .text",
+        ".tabs__panel--details",
+        ".details-pre",
+        "#tab-content1",
+        "#tab1",
+        ".tab-pane.active",
+        ".panel-body",
+    ]:
+        candidate = soup.select_one(selector)
+        if candidate and len(candidate.get_text(strip=True)) > 40:
+            return candidate
+
+    # 2) Блок с заголовком Produktbeschreibung, но исключаем рекламный баннер компании
+    for header in soup.find_all(["h2", "h3", "h4"]):
         if "produktbeschreibung" in header.get_text(strip=True).lower():
             parent = header.find_parent()
             if parent:
-                candidate = parent.find(class_="text")
-                if candidate:
+                candidate = parent.find(class_="text") or parent
+                txt = candidate.get_text(strip=True).lower()
+                # Исключаем общий корпоративный баннер ("Unser Unternehmen bietet...")
+                if "unser unternehmen bietet" in txt and len(txt) < 300:
+                    continue
+                if candidate and len(txt) > 40:
                     return candidate
 
-    # 2) Tabs: details panel
-    candidate = soup.select_one(".tabs__panel--details .text")
-    if candidate:
-        return candidate
+    # 3) Обычные текстовые карточки, за исключением корпоративного баннера
+    for cand in soup.select(".card .text"):
+        txt = cand.get_text(strip=True).lower()
+        if "unser unternehmen bietet" in txt and len(txt) < 300:
+            continue
+        if len(txt) > 40:
+            return cand
 
-    # 3) First description-like text block
-    candidate = soup.select_one(".card .text")
-    if candidate:
-        return candidate
-
-    # 4) Fallback to body content
+    # 4) Fallback к содержимому body
     return soup.body

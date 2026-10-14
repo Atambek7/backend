@@ -334,13 +334,25 @@ class PatchProductView(APIView):
         items: list = request.data if isinstance(request.data, list) else [request.data]
         results = []
 
-        for item in items:
+        query_controller = request.query_params.get("controller")
+        query_storefront = request.query_params.get("storefront")
+
+        for raw_item in items:
+            item = dict(raw_item)
+            if not item.get("controller") and query_controller:
+                item["controller"] = query_controller
+            if not item.get("storefront") and query_storefront:
+                item["storefront"] = query_storefront
+            elif not item.get("storefront"):
+                item["storefront"] = "de"
+
             serializer = self.serializer_class(data=item)
             serializer.is_valid(raise_exception=True)
 
             validated_data = serializer.validated_data
             ean = validated_data["ean"]
             controller = validated_data["controller"]
+            storefront = str(validated_data.get("storefront") or "de")
 
             attributes = {}
             if "title" in validated_data:
@@ -352,57 +364,86 @@ class PatchProductView(APIView):
             if "picture_urls" in validated_data:
                 attributes["picture"] = validated_data["picture_urls"]
 
-            storefront = str(validated_data.get("storefront")) if validated_data.get("storefront") else "de"
-
             payload = {"ean": [ean], "attributes": attributes}
 
             response_item = {
+                "ean": ean,
+                "controller": controller,
+                "storefront": storefront,
                 "received_data": validated_data,
                 "product_data_updated": False,
                 "price_updated": False,
             }
 
-            if attributes:
-                async with aiohttp.ClientSession() as client:
-                    rac = RestApiController(controller=controller, session=client)
+            async with aiohttp.ClientSession() as client:
+                rac = RestApiController(controller=controller, session=client)
+
+                if attributes:
                     api_response = await rac.send_request(
                         method="PATCH",
                         endpoint=f"/product-data?locale={self.to_locale_value(storefront)}",
                         json=payload,
                     )
-                response_item["product_data_updated"] = True
-                response_item["product_data_response"] = api_response
+                    response_item["product_data_updated"] = True
+                    response_item["product_data_response"] = api_response
 
-            if validated_data.get("unit_id"):
-                unit_id: str = validated_data.get("unit_id")
                 price = validated_data.get("price")
+                if price is not None:
+                    unit_id = validated_data.get("unit_id")
+                    if not unit_id:
+                        try:
+                            res = await rac.send_request(
+                                method="GET",
+                                endpoint=f"/units?storefront={storefront}&id_offer={ean}",
+                            )
+                            units = res.get("data") or []
+                            if not units:
+                                res = await rac.send_request(
+                                    method="GET",
+                                    endpoint=f"/units?storefront={storefront}&ean={ean}",
+                                )
+                                units = res.get("data") or []
+                            if not units:
+                                res = await rac.send_request(
+                                    method="GET",
+                                    endpoint=f"/products/ean/{ean}?storefront={storefront}&embedded=units",
+                                )
+                                units = (res.get("data") or {}).get("units") or []
+                            if units:
+                                unit_id = units[0].get("id_unit")
+                        except Exception as e:
+                            response_item["unit_lookup_error"] = str(e)
 
-                if unit_id and price is not None:
-                    unit_endpoint = (
-                        f"/units/{unit_id}?storefront={storefront}"
-                    )
-                    async with aiohttp.ClientSession() as client:
-                        rac = RestApiController(controller=controller, session=client)
-                        payload = rac.make_price_payload(
+                    if unit_id:
+                        unit_endpoint = f"/units/{unit_id}?storefront={storefront}"
+                        price_payload = rac.make_price_payload(
                             storefront=storefront,
                             price=float(price),
                         )
-
                         try:
                             price_response = await rac.send_request(
                                 method="PATCH",
                                 endpoint=unit_endpoint,
-                                json=payload,
+                                json=price_payload,
                             )
-
+                            response_item["unit_id"] = unit_id
+                            response_item["price_updated"] = True
+                            response_item["price_response"] = price_response
+                            response_item["applied_price"] = price_payload
                         except Exception as exc:
-                            return Response(f"Failed to update price: {exc}, json = {payload}", status=status.HTTP_400_BAD_REQUEST)
+                            return Response(
+                                f"Failed to update price: {exc}, json = {price_payload}",
+                                status=status.HTTP_400_BAD_REQUEST,
+                            )
+                    else:
+                        response_item["price_updated"] = False
+                        response_item["error"] = f"Unit not found for EAN {ean} on storefront {storefront}"
 
-                    response_item["price_updated"] = True
-                    response_item["price_response"] = price_response
+            results.append(response_item)
 
-                results.append(response_item)
-        return Response({"results": results}, status=status.HTTP_200_OK)
+        if isinstance(request.data, list):
+            return Response({"results": results}, status=status.HTTP_200_OK)
+        return Response({"results": results, **(results[0] if results else {})}, status=status.HTTP_200_OK)
         
 
     
@@ -454,7 +495,7 @@ class DeleteProductView(APIView):
         
         async with aiohttp.ClientSession() as client:
             rac = RestApiController(controller=controller, session=client)
-            result = {}
+            result = {"product_data": {}, "units": {}}
             for locale in locales:
                 delete_response = {}
                 try:
@@ -462,10 +503,39 @@ class DeleteProductView(APIView):
                         method="DELETE",
                         endpoint=f"/product-data/{ean}?locale={locale}",
                     )
-                    result[locale] = delete_response.get("data")
+                    result["product_data"][locale] = delete_response.get("data")
                 except Exception as exc:
-                    result[locale] = f"Failed to delete: {exc}"
-                    
+                    result["product_data"][locale] = f"Failed to delete: {exc}"
+
+            for storefront in storefronts:
+                try:
+                    inv_res = await rac.send_request(
+                        method="GET",
+                        endpoint=f"/units?storefront={storefront}&id_offer={ean}",
+                    )
+                    unit_list = inv_res.get("data") if isinstance(inv_res, dict) else None
+                    if not unit_list:
+                        inv_res = await rac.send_request(
+                            method="GET",
+                            endpoint=f"/units?storefront={storefront}&ean={ean}",
+                        )
+                        unit_list = inv_res.get("data") if isinstance(inv_res, dict) else None
+
+                    if unit_list and isinstance(unit_list, list):
+                        for u in unit_list:
+                            u_id = u.get("id_unit")
+                            if u_id:
+                                try:
+                                    await rac.send_request(
+                                        method="DELETE",
+                                        endpoint=f"/units/{u_id}?storefront={storefront}",
+                                    )
+                                    result["units"][f"{storefront}:{u_id}"] = "deleted"
+                                except Exception as u_err:
+                                    result["units"][f"{storefront}:{u_id}"] = f"Failed to delete: {u_err}"
+                except Exception as exc:
+                    result["units"][storefront] = f"Lookup failed: {exc}"
+
             return Response({"result": result}, status=status.HTTP_200_OK)
         
 
@@ -496,13 +566,19 @@ class PutProductView(APIView):
         manufacturer: str,
         price: float,
     ) -> tuple[str, str, dict]:
+        try:
+            numeric_price = float(price or 0)
+            price_cents = int(round(numeric_price * 100)) if numeric_price > 0 else 10000
+        except (ValueError, TypeError):
+            price_cents = 10000
+
         category_selector_data = {
             "item": {
                 "title": title,
                 "description": description,
                 "manufacturer": manufacturer,
             },
-            "price": price,
+            "price": price_cents,
         }
         response = await rac.send_request(
             "POST",
@@ -527,16 +603,44 @@ class PutProductView(APIView):
         *,
         ean: str,
         storefront: str,
+        id_offer: str | None = None,
     ) -> str | None:
-        response = await rac.send_request(
-            method="GET",
-            endpoint=f"/products/ean/{ean}?storefront={storefront}&embedded=units",
-        )
-        data = response.get("data") if isinstance(response, dict) else None
-        units = data.get("units") if isinstance(data, dict) else None
-        if not units:
-            return None
-        return units[0].get("id_unit")
+        lookup_id = id_offer or ean
+        try:
+            inv_res = await rac.send_request(
+                method="GET",
+                endpoint=f"/units?storefront={storefront}&id_offer={lookup_id}",
+            )
+            data = inv_res.get("data") if isinstance(inv_res, dict) else None
+            if data and isinstance(data, list) and data[0].get("id_unit"):
+                return str(data[0]["id_unit"])
+        except Exception:
+            pass
+
+        try:
+            inv_res_ean = await rac.send_request(
+                method="GET",
+                endpoint=f"/units?storefront={storefront}&ean={ean}",
+            )
+            data_ean = inv_res_ean.get("data") if isinstance(inv_res_ean, dict) else None
+            if data_ean and isinstance(data_ean, list) and data_ean[0].get("id_unit"):
+                return str(data_ean[0]["id_unit"])
+        except Exception:
+            pass
+
+        try:
+            response = await rac.send_request(
+                method="GET",
+                endpoint=f"/products/ean/{ean}?storefront={storefront}&embedded=units",
+            )
+            data = response.get("data") if isinstance(response, dict) else None
+            units = data.get("units") if isinstance(data, dict) else None
+            if units:
+                return str(units[0].get("id_unit"))
+        except Exception:
+            pass
+
+        return None
 
     async def _create_or_update_unit(
         self,
@@ -583,6 +687,7 @@ class PutProductView(APIView):
                 rac,
                 ean=ean,
                 storefront=storefront,
+                id_offer=id_offer,
             )
             if not unit_id:
                 return {
@@ -605,7 +710,16 @@ class PutProductView(APIView):
 
     async def _upsert_product(self, request):
         serializer = self.serializer_class(data=request.data)
-        serializer.is_valid(raise_exception=True)
+        if not serializer.is_valid():
+            return Response(
+                {
+                    "success": False,
+                    "message": "Product validation failed before Kaufland submission",
+                    "errors": serializer.errors,
+                    "ean": request.data.get("ean"),
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
         validated_data = serializer.validated_data
         controller = validated_data["controller"]
@@ -624,6 +738,7 @@ class PutProductView(APIView):
             "length": validated_data["length"],
             "width": validated_data["width"],
             "material": validated_data["material"],
+            "material_composition": validated_data.get("material_composition", ""),
             "number_of_units": "",
             "amount": validated_data["amount"],
             "id_offer": validated_data["id_offer"],
@@ -977,3 +1092,43 @@ class ActivateProductView(APIView):
             f"activate product finished ean={ean} controller={controller} success_count={len(result['response'])} failed_count={len(result['failed_storefronts'])}"
         )
         return Response(result)
+
+
+class ProductStatusView(APIView):
+    """
+    Эндпоинт для проверки статуса публикации и валидации товара на Kaufland:
+    GET /api/products/status/<str:ean>/?controller=jv[&storefront=de]
+    """
+    permission_classes = [AllowAny]
+
+    async def get(self, request, ean: str = None):
+        clean_ean = str(ean or request.query_params.get("ean") or "").strip()
+        if not clean_ean:
+            return Response(
+                {
+                    "success": False,
+                    "message": "Parameter 'ean' is required (in URL path or as query parameter ?ean=...).",
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        controller = request.query_params.get("controller", "").strip().lower()
+        if not controller or controller not in ["jv", "xl"]:
+            return Response(
+                {
+                    "success": False,
+                    "message": "Query parameter 'controller' is required and must be 'jv' or 'xl'.",
+                    "ean": clean_ean,
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        storefront = request.query_params.get("storefront", "de").strip().lower()
+
+        async with aiohttp.ClientSession() as session:
+            kaufland_controller = KauflandController(session, controller)
+            status_data = await kaufland_controller.get_product_status(clean_ean, storefront=storefront)
+
+        http_status = status.HTTP_200_OK if status_data.get("status") != "NOT_FOUND" else status.HTTP_404_NOT_FOUND
+        return Response(status_data, status=http_status)
+

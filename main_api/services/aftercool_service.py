@@ -5,7 +5,10 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 
 import httpx
+import config
 from main_api.src.logger import log
+from main_api.src.utils.ean_utils import normalize_ean
+from main_api.src.utils.price_utils import parse_price
 
 
 class AftercoolError(Exception):
@@ -56,18 +59,18 @@ class AftercoolService:
         *,
         login_url: str = "https://aftercool.de/auth/login",
         products_url: str = "https://aftercool.de/api/products",
-        username: str = "Miras",
-        password: str = "Miras112112",
+        username: str | None = None,
+        password: str | None = None,
         timeout: httpx.Timeout | None = None,
     ):
         self.login_url = login_url
         self.products_url = products_url
-        self.username = username
-        self.password = password
+        self.username = username or getattr(config, "AFTERCOOL_USERNAME", "Miras")
+        self.password = password or getattr(config, "AFTERCOOL_PASSWORD", "Miras112112")
         self.timeout = (
             timeout
             if timeout
-            else httpx.Timeout(connect=5.0, read=10.0, write=10.0, pool=5.0)
+            else httpx.Timeout(connect=15.0, read=30.0, write=30.0, pool=15.0)
         )
 
     async def login(self) -> str:
@@ -195,6 +198,7 @@ class AftercoolService:
         *,
         account: str = "jv",
         dataset: str = "lister",
+        factory_id: str = "",
         include_row: int = 1,
         page_size: int = 500,
         max_pages: int = 40,
@@ -208,6 +212,7 @@ class AftercoolService:
             query = AftercoolProductsQuery(
                 account=account,
                 dataset=dataset,
+                factory_id=factory_id,
                 include_row=include_row,
                 limit=safe_page_size,
                 offset=page * safe_page_size,
@@ -224,6 +229,32 @@ class AftercoolService:
                 break
 
         return all_items
+
+    async def get_stammartikel_beschreibung(
+        self,
+        session: str,
+        stamm_id: str,
+    ) -> str:
+        """
+        Запрашивает HTML-описание мастер-товара (I_stammartikel) из Aftercool.
+        """
+        if not stamm_id:
+            return ""
+        try:
+            async with httpx.AsyncClient(timeout=self.timeout) as client:
+                r = await client.get(
+                    self.products_url,
+                    cookies={"session": session},
+                    params={"q": str(stamm_id).strip(), "include_row": 1},
+                )
+                if r.status_code == 200:
+                    items = r.json().get("items", [])
+                    if items:
+                        row = items[0].get("row") or {}
+                        return str(row.get("Beschreibung") or "").strip()
+        except Exception as e:
+            log(f"Failed to fetch stammartikel {stamm_id}: {e}", level="warning")
+        return ""
 
     def extract_ean_price_pairs(
         self, items: list[dict[str, Any]]
@@ -353,48 +384,10 @@ class AftercoolService:
 
     @staticmethod
     def _normalize_ean(value: Any) -> str | None:
-        if value is None:
-            return None
-        text = str(value).strip()
-        if not text:
-            return None
-        if text.endswith(".0"):
-            try:
-                text = str(int(float(text)))
-            except (TypeError, ValueError):
-                pass
-        digits = re.sub(r"\D", "", text)
-        if len(digits) < 8:
-            return None
-        return digits
+        digits = normalize_ean(value)
+        return digits if len(digits) >= 8 else None
 
     @staticmethod
     def _parse_price(value: Any) -> float | None:
-        if value is None or isinstance(value, bool):
-            return None
-        if isinstance(value, (int, float)):
-            numeric = float(value)
-            return round(numeric, 2) if numeric > 0 else None
-
-        text = str(value).strip()
-        if not text:
-            return None
-        text = text.replace("\u00a0", "").replace(" ", "")
-        if "," in text and "." in text:
-            if text.rfind(",") > text.rfind("."):
-                text = text.replace(".", "").replace(",", ".")
-            else:
-                text = text.replace(",", "")
-        else:
-            text = text.replace(",", ".")
-
-        match = re.search(r"-?\d+(?:\.\d+)?", text)
-        if not match:
-            return None
-        try:
-            numeric = float(match.group(0))
-        except ValueError:
-            return None
-        if numeric <= 0:
-            return None
-        return round(numeric, 2)
+        parsed = parse_price(value)
+        return round(parsed, 2) if parsed > 0 else None

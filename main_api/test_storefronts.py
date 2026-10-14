@@ -13,7 +13,7 @@ from main_api.src.controller.rest_api_controller import RestApiController
 
 
 class StorefrontsTestCase(TestCase):
-    def test_config_storefronts_contains_nl_and_es(self):
+    def test_config_storefronts_contains_nl_and_es(self): 
         """Проверяем, что 'nl' и 'es' присутствуют в глобальном списке витрин config.py."""
         self.assertIn("nl", config.storefronts)
         self.assertIn("es", config.storefronts)
@@ -47,7 +47,7 @@ class StorefrontsTestCase(TestCase):
     def test_put_data_serializer_accepts_es(self):
         """Проверяем, что PutDataSerializer валидирует список витрин с 'es'."""
         payload = {
-            "ean": "4000000000000",
+            "ean": "4069943370027",
             "controller": "jv",
             "title": "Test Product",
             "description": "Test description",
