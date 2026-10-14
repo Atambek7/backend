@@ -16,7 +16,8 @@ from main_api.external_views import (
     DeleteProductView,
     PutProductView,
     DeactivateProductView,
-    ActivateProductView
+    ActivateProductView,
+    ProductStatusView,
 )
 from main_api.auth.views import CustomTokenObtainSlidingView
 
@@ -46,6 +47,8 @@ urlpatterns = [
     ),
     path("products/delete/<str:ean>", DeleteProductView.as_view(), name="delete_product"),
     path("products/upload/", PutProductView.as_view(), name="put_product"),
+    path("products/status/<str:ean>/", ProductStatusView.as_view(), name="product_status"),
+    path("products/status/", ProductStatusView.as_view(), name="product_status_query"),
     # path("fabrics/", RetreiveProductView.as_view(), name="retrieve_fabric"),
     path("products/deactivate/<str:ean>", DeactivateProductView.as_view(), name="deactivate_product"),
     path("products/activate/<str:ean>", ActivateProductView.as_view(), name="activate_product"),

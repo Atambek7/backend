@@ -24,6 +24,19 @@ class AftercoolProductRetrieveService:
                         level="info",
                     )
                     response = await client.get(url, headers=headers, params=params)
+                    if response.status_code in (401, 403):
+                        log(
+                            f"aftercool session expired status={response.status_code} product_id={product_id}",
+                            save=True,
+                            level="warning",
+                        )
+                        return {
+                            "success": False,
+                            "expired": True,
+                            "status_code": response.status_code,
+                            "items": [],
+                            "payload": {},
+                        }
                     payload = response.json() if response.status_code == 200 else {}
                     items = payload.get("items") if isinstance(payload, dict) else []
 
@@ -41,6 +54,7 @@ class AftercoolProductRetrieveService:
                         "success": False,
                         "items": [],
                         "payload": payload if isinstance(payload, dict) else {},
+                        "status_code": response.status_code,
                     }
                 except Exception as exc:
                     log(

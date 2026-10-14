@@ -183,3 +183,22 @@ main_api/src/ftp_src/media/
 logs.csv
 .vscode/
 media
+logs/
+
+# Temporary state files and diagnostic reports
+.failed_items_*.json
+.reupload_state_*.json
+PROJECT_ISSUES_AUDIT.txt
+allowed_factories.txt
+ean_list_de.md
+eans_real_products.txt
+reports/
+backups/
+data/
+context/
+
+# One-off diagnostic scratch scripts
+check_jv_catalog.py
+inspect_item.py
+test_factory_prices.py
+
